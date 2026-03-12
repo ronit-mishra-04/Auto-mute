@@ -1,0 +1,426 @@
+#!/bin/bash
+# ============================================================================
+# automute — CLI tool for WiFi-based speaker muting on macOS
+# Usage: automute [command]
+# ============================================================================
+
+APP_NAME="automute"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.txt"
+INSTALL_DIR="$HOME/.local/bin/auto_mute"
+PLIST_NAME="com.automute.agent.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME"
+STATE_FILE="$HOME/.auto_mute_state"
+LOG_FILE="/tmp/auto_mute.log"
+
+# ── Colors ──────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# ── Helpers ─────────────────────────────────────────────────────
+print_header() {
+    echo ""
+    echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}  ║         🔇  Auto-Mute            ║${NC}"
+    echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════╝${NC}"
+    echo ""
+}
+
+is_running() {
+    launchctl list 2>/dev/null | grep -q "com.automute.agent"
+}
+
+get_dns_domain() {
+    echo "show State:/Network/Global/DNS" | scutil 2>/dev/null \
+        | grep "SearchDomains" -A 5 \
+        | grep -oE '[0-9]+ : .+' \
+        | awk -F' : ' '{print $2}' \
+        | tr '\n' ' ' | xargs
+}
+
+ensure_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" << 'EOF'
+# Auto-Mute Configuration
+# Add networks that trigger speaker muting.
+# Use DNS: for domain matching, WIFI: for WiFi name matching.
+# Example:
+#   DNS:uic.edu
+#   WIFI:MyHomeNetwork
+EOF
+        echo -e "${YELLOW}Created new config file: $CONFIG_FILE${NC}"
+    fi
+}
+
+# ── Commands ────────────────────────────────────────────────────
+
+cmd_on() {
+    ensure_config
+
+    # Check if any targets are configured
+    local has_entries=false
+    while IFS= read -r line; do
+        if [[ "$line" == DNS:* || "$line" == WIFI:* ]]; then
+            has_entries=true
+            break
+        fi
+    done < "$CONFIG_FILE"
+
+    if [[ "$has_entries" != "true" ]]; then
+        echo -e "${YELLOW}⚠  No networks configured yet.${NC}"
+        echo -e "   Run ${BOLD}automute add${NC} to add a network first."
+        return 1
+    fi
+
+    # Unload existing
+    if is_running; then
+        launchctl unload "$PLIST_DST" 2>/dev/null || true
+    fi
+
+    # Copy files to install dir
+    mkdir -p "$INSTALL_DIR"
+    cp "$SCRIPT_DIR/auto_mute.sh" "$INSTALL_DIR/auto_mute.sh"
+    cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt"
+    chmod +x "$INSTALL_DIR/auto_mute.sh"
+
+    # Generate plist
+    cat > "$PLIST_DST" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.automute.agent</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${INSTALL_DIR}/auto_mute.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>10</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/auto_mute.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/auto_mute_error.log</string>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>
+PLIST
+
+    launchctl load "$PLIST_DST"
+
+    if is_running; then
+        echo -e "${GREEN}✅ Auto-Mute is ON${NC}"
+        echo -e "   Checking WiFi every 10 seconds."
+        echo -e "   ${DIM}Logs: /tmp/auto_mute.log${NC}"
+    else
+        echo -e "${RED}❌ Failed to start. Check /tmp/auto_mute_error.log${NC}"
+        return 1
+    fi
+}
+
+cmd_off() {
+    if is_running; then
+        launchctl unload "$PLIST_DST" 2>/dev/null
+    fi
+    rm -f "$PLIST_DST"
+    rm -rf "$INSTALL_DIR"
+    rm -f "$STATE_FILE"
+    osascript -e 'set volume without output muted' 2>/dev/null
+
+    echo -e "${GREEN}✅ Auto-Mute is OFF${NC}"
+    echo -e "   Speakers unmuted."
+}
+
+cmd_status() {
+    # Running?
+    if is_running; then
+        echo -e "${GREEN}🟢 Status:      Running${NC}"
+    else
+        echo -e "${RED}🔴 Status:      Stopped${NC}"
+    fi
+
+    # Configured networks
+    echo ""
+    echo -e "${BOLD}Configured Networks:${NC}"
+    local count=0
+    if [[ -f "$CONFIG_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
+            if [[ "$line" == DNS:* ]]; then
+                echo -e "   ${CYAN}🌐${NC} $line"
+                ((count++))
+            elif [[ "$line" == WIFI:* ]]; then
+                echo -e "   ${CYAN}📶${NC} $line"
+                ((count++))
+            fi
+        done < "$CONFIG_FILE"
+    fi
+    if [[ $count -eq 0 ]]; then
+        echo -e "   ${DIM}(none — run 'automute add' to add one)${NC}"
+    fi
+
+    # Current network
+    echo ""
+    local dns=$(get_dns_domain)
+    if [[ -n "$dns" ]]; then
+        echo -e "📶 DNS Domain:  ${BOLD}$dns${NC}"
+    else
+        echo -e "📶 DNS Domain:  ${DIM}not connected${NC}"
+    fi
+
+    # Match check
+    local matched=""
+    if [[ -n "$dns" && -f "$CONFIG_FILE" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" == DNS:* ]]; then
+                local target="${line#DNS:}"
+                target=$(echo "$target" | xargs)
+                if [[ "$dns" == *"$target"* ]]; then
+                    matched="$line"
+                    break
+                fi
+            fi
+        done < "$CONFIG_FILE"
+    fi
+    if [[ -n "$matched" ]]; then
+        echo -e "${GREEN}✅ Match:       $matched${NC}"
+    else
+        echo -e "${RED}❌ Match:       Not on a target network${NC}"
+    fi
+
+    # Audio
+    local muted=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
+    if [[ "$muted" == "true" ]]; then
+        echo -e "🔇 Speakers:    Muted"
+    else
+        echo -e "🔊 Speakers:    Not muted"
+    fi
+
+    # Auto-mute state
+    if [[ -f "$STATE_FILE" ]]; then
+        local state=$(cat "$STATE_FILE")
+        if [[ "$state" == "muted_by_auto_mute" ]]; then
+            echo -e "🤖 Auto-Mute:   ${GREEN}Active${NC}"
+        else
+            echo -e "🤖 Auto-Mute:   ${DIM}Inactive${NC}"
+        fi
+    else
+        echo -e "🤖 Auto-Mute:   ${DIM}Inactive${NC}"
+    fi
+}
+
+cmd_add() {
+    ensure_config
+
+    local type="$1"
+    local value="$2"
+
+    if [[ -z "$type" || -z "$value" ]]; then
+        echo -e "${BOLD}Add a network to monitor:${NC}"
+        echo ""
+        echo "  automute add dns <domain>     Add a DNS domain"
+        echo "  automute add wifi <name>      Add a WiFi network name"
+        echo ""
+        echo -e "${DIM}Examples:${NC}"
+        echo "  automute add dns uic.edu"
+        echo "  automute add wifi HomeNetwork"
+        echo ""
+
+        # Interactive mode
+        echo -e "${BOLD}Or add interactively:${NC}"
+        echo "  1) DNS domain"
+        echo "  2) WiFi name"
+        echo ""
+        read -p "Choose (1/2): " choice
+
+        if [[ "$choice" == "1" ]]; then
+            read -p "Enter DNS domain: " value
+            type="dns"
+        elif [[ "$choice" == "2" ]]; then
+            read -p "Enter WiFi name: " value
+            type="wifi"
+        else
+            echo "Cancelled."
+            return
+        fi
+    fi
+
+    if [[ -z "$value" ]]; then
+        echo -e "${RED}Error: No value provided.${NC}"
+        return 1
+    fi
+
+    local prefix
+    case "$type" in
+        dns|DNS) prefix="DNS" ;;
+        wifi|WIFI) prefix="WIFI" ;;
+        *)
+            echo -e "${RED}Error: Type must be 'dns' or 'wifi'.${NC}"
+            return 1
+            ;;
+    esac
+
+    local entry="${prefix}:${value}"
+
+    # Check for duplicates
+    if grep -qF "$entry" "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "${YELLOW}⚠  '$entry' is already configured.${NC}"
+        return 0
+    fi
+
+    echo "$entry" >> "$CONFIG_FILE"
+    echo -e "${GREEN}✅ Added: $entry${NC}"
+
+    # Re-apply if running
+    if is_running; then
+        echo -e "${DIM}→ Updating running agent...${NC}"
+        cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null
+        echo -e "${GREEN}  Applied!${NC}"
+    fi
+}
+
+cmd_remove() {
+    ensure_config
+
+    local value="$1"
+
+    if [[ -z "$value" ]]; then
+        # Show list and let user pick
+        echo -e "${BOLD}Current networks:${NC}"
+        local entries=()
+        local i=1
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "${line// }" ]] && continue
+            if [[ "$line" == DNS:* || "$line" == WIFI:* ]]; then
+                entries+=("$line")
+                echo "  $i) $line"
+                ((i++))
+            fi
+        done < "$CONFIG_FILE"
+
+        if [[ ${#entries[@]} -eq 0 ]]; then
+            echo -e "  ${DIM}(no networks configured)${NC}"
+            return
+        fi
+
+        echo ""
+        read -p "Remove which? (number or 'q' to cancel): " choice
+
+        if [[ "$choice" == "q" || -z "$choice" ]]; then
+            echo "Cancelled."
+            return
+        fi
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#entries[@]} )); then
+            value="${entries[$((choice-1))]}"
+        else
+            echo -e "${RED}Invalid choice.${NC}"
+            return 1
+        fi
+    fi
+
+    # Remove the line from config
+    if grep -qF "$value" "$CONFIG_FILE" 2>/dev/null; then
+        grep -vF "$value" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        echo -e "${GREEN}✅ Removed: $value${NC}"
+
+        # Re-apply if running
+        if is_running; then
+            echo -e "${DIM}→ Updating running agent...${NC}"
+            cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null
+            echo -e "${GREEN}  Applied!${NC}"
+        fi
+    else
+        echo -e "${YELLOW}⚠  '$value' not found in config.${NC}"
+    fi
+}
+
+cmd_list() {
+    ensure_config
+
+    echo -e "${BOLD}Configured Networks:${NC}"
+    local count=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// }" ]] && continue
+        if [[ "$line" == DNS:* ]]; then
+            echo -e "  ${CYAN}🌐${NC} $line"
+            ((count++))
+        elif [[ "$line" == WIFI:* ]]; then
+            echo -e "  ${CYAN}📶${NC} $line"
+            ((count++))
+        fi
+    done < "$CONFIG_FILE"
+
+    if [[ $count -eq 0 ]]; then
+        echo -e "  ${DIM}(none — run 'automute add' to add one)${NC}"
+    fi
+}
+
+cmd_log() {
+    if [[ -f "$LOG_FILE" ]]; then
+        echo -e "${BOLD}Recent log entries:${NC}"
+        echo ""
+        tail -20 "$LOG_FILE"
+        echo ""
+        echo -e "${DIM}For live log: tail -f $LOG_FILE${NC}"
+    else
+        echo -e "${DIM}No log file yet. Start the agent with 'automute on'.${NC}"
+    fi
+}
+
+cmd_help() {
+    print_header
+    echo -e "${BOLD}Usage:${NC} automute <command>"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo -e "  ${GREEN}on${NC}              Start monitoring (mutes on target WiFi)"
+    echo -e "  ${RED}off${NC}             Stop monitoring (unmutes & cleans up)"
+    echo -e "  ${CYAN}status${NC}          Show current state"
+    echo ""
+    echo -e "  ${CYAN}add${NC}             Add a network to monitor"
+    echo -e "  ${CYAN}remove${NC}          Remove a network"
+    echo -e "  ${CYAN}list${NC}            List configured networks"
+    echo ""
+    echo -e "  ${CYAN}log${NC}             Show recent log entries"
+    echo -e "  ${CYAN}help${NC}            Show this help"
+    echo ""
+    echo -e "${BOLD}Examples:${NC}"
+    echo "  automute on                   Start the agent"
+    echo "  automute add dns uic.edu      Add UIC WiFi by domain"
+    echo "  automute add wifi HomeNet     Add home WiFi by name"
+    echo "  automute remove               Interactive removal"
+    echo "  automute off                  Stop and unmute"
+    echo ""
+}
+
+# ── Main ────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    on|start)       cmd_on ;;
+    off|stop)       cmd_off ;;
+    status|s)       cmd_status ;;
+    add|a)          cmd_add "$2" "$3" ;;
+    remove|rm|r)    cmd_remove "$2" ;;
+    list|ls|l)      cmd_list ;;
+    log)            cmd_log ;;
+    help|--help|-h) cmd_help ;;
+    "")             cmd_help ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        echo "Run 'automute help' for usage."
+        exit 1
+        ;;
+esac

@@ -1,0 +1,21 @@
+# Auto-Mute Configuration
+# ============================================================================
+# Add networks that should trigger speaker muting.
+# You can use EITHER method (or both) for each network:
+#
+#   DNS domain:  Works reliably on macOS 26, no extra setup needed.
+#                To find a WiFi's domain, connect to it and run:
+#                  echo "show State:/Network/Global/DNS" | scutil
+#                Look for "SearchDomains".
+#
+#   WiFi name:   Requires a macOS Shortcut called "Get-WiFi-Name".
+#                Run ./setup_shortcut.sh for setup instructions.
+#
+# Format: One entry per line. Use DNS: or WIFI: prefix.
+# Matching is partial — "uic.edu" matches "client.wireless.uic.edu".
+# ============================================================================
+
+
+# Examples (UNCOMMENT AND EDIT TO ADD MORE NETWORKS):
+# DNS: <ADD YOUR WIFI DNS HERE>
+# WIFI: <ADD YOUR WIFI NAME HERE>
