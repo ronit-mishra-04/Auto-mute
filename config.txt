@@ -12,7 +12,7 @@
 #                Run ./setup_shortcut.sh for setup instructions.
 #
 # Format: One entry per line. Use DNS: or WIFI: prefix.
-# Matching is partial — "uic.edu" matches "client.wireless.uic.edu".
+# Matching is partial — "example.edu" matches "client.wireless.example.edu".
 # ============================================================================
 
 
