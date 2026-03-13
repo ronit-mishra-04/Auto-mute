@@ -56,3 +56,36 @@ Run this command in the repository folder and follow the instructions:
   ```bash
   echo "show State:/Network/Global/DNS" | scutil
   ```
+
+## Using `automute`
+
+The `automute` command is the main way to control Auto-Mute. It handles turning monitoring on/off, managing your network list, and checking status.
+
+| Command | Description |
+|---------|-------------|
+| `automute on` | Start background monitoring (checks WiFi every 10s) |
+| `automute off` | Stop monitoring, unmute speakers, and clean up |
+| `automute status` | Show running state, configured networks, and current match |
+| `automute add dns <domain>` | Add a DNS domain to monitor |
+| `automute add wifi <name>` | Add a WiFi network name to monitor |
+| `automute add` | Add a network interactively |
+| `automute remove` | Remove a network interactively |
+| `automute remove "DNS:example.edu"` | Remove a specific entry directly |
+| `automute list` | List all configured networks |
+| `automute log` | Show recent log entries |
+| `automute help` | Show help |
+
+### Quick Start Example
+```bash
+# Add your network by DNS domain
+automute add dns example.edu or example.com or example.org
+
+# Turn on auto-muting
+automute on
+
+# Check if it's working
+automute status
+
+# When you no longer need it
+automute off
+```
