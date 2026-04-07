@@ -5,12 +5,20 @@
 # ============================================================================
 
 APP_NAME="automute"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SOURCE_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE_PATH" ]]; do
+    LINK_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+    SOURCE_PATH="$(readlink "$SOURCE_PATH")"
+    [[ "$SOURCE_PATH" != /* ]] && SOURCE_PATH="$LINK_DIR/$SOURCE_PATH"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 CONFIG_FILE="$SCRIPT_DIR/config.txt"
 INSTALL_DIR="$HOME/.local/bin/auto_mute"
-PLIST_NAME="com.automute.agent.plist"
+LAUNCHD_LABEL="com.automute.agent"
+PLIST_NAME="${LAUNCHD_LABEL}.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME"
 STATE_FILE="$HOME/.auto_mute_state"
+NETWORK_KEY_FILE="$HOME/.auto_mute_last_network_key"
 LOG_FILE="/tmp/auto_mute.log"
 
 # ── Colors ──────────────────────────────────────────────────────
@@ -32,7 +40,28 @@ print_header() {
 }
 
 is_running() {
-    launchctl list 2>/dev/null | grep -q "com.automute.agent"
+    launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 && return 0
+    launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"
+}
+
+stop_agent() {
+    launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    launchctl unload "$PLIST_DST" >/dev/null 2>&1 || true
+    launchctl remove "$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+}
+
+start_agent() {
+    # Clear any stale registration before loading the freshly copied script/config.
+    stop_agent
+
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1; then
+        :
+    else
+        launchctl load "$PLIST_DST" >/dev/null 2>&1 || return 1
+    fi
+
+    launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    is_running
 }
 
 get_dns_domain() {
@@ -41,6 +70,21 @@ get_dns_domain() {
         | grep -oE '[0-9]+ : .+' \
         | awk -F' : ' '{print $2}' \
         | tr '\n' ' ' | xargs
+}
+
+get_wifi_name() {
+    shortcuts run "Get-WiFi-Name" 2>/dev/null | tr -d '\n'
+}
+
+get_output_transport() {
+    system_profiler SPAudioDataType 2>/dev/null \
+        | awk '/Default Output Device: Yes/{found=1} found && /Transport:/{print $2; exit}'
+}
+
+is_builtin_output() {
+    local transport
+    transport=$(get_output_transport)
+    [[ "$transport" == "Built-in" ]]
 }
 
 ensure_config() {
@@ -62,6 +106,21 @@ EOF
 cmd_on() {
     ensure_config
 
+    local source_script="$SCRIPT_DIR/auto_mute.sh"
+    local source_config="$CONFIG_FILE"
+
+    if [[ ! -f "$source_script" ]]; then
+        echo -e "${RED}❌ Missing required file: $source_script${NC}"
+        echo "   The automute command needs auto_mute.sh in the same folder as automute."
+        echo "   Fix: copy auto_mute.sh there, or run ./automute from the project folder once."
+        return 1
+    fi
+
+    if [[ ! -f "$source_config" ]]; then
+        echo -e "${YELLOW}⚠  Config not found next to automute. Creating: $source_config${NC}"
+        ensure_config
+    fi
+
     # Check if any targets are configured
     local has_entries=false
     while IFS= read -r line; do
@@ -77,15 +136,19 @@ cmd_on() {
         return 1
     fi
 
-    # Unload existing
-    if is_running; then
-        launchctl unload "$PLIST_DST" 2>/dev/null || true
-    fi
-
     # Copy files to install dir
-    mkdir -p "$INSTALL_DIR"
-    cp "$SCRIPT_DIR/auto_mute.sh" "$INSTALL_DIR/auto_mute.sh"
-    cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt"
+    mkdir -p "$INSTALL_DIR" || {
+        echo -e "${RED}❌ Failed to create install directory: $INSTALL_DIR${NC}"
+        return 1
+    }
+    cp "$source_script" "$INSTALL_DIR/auto_mute.sh" || {
+        echo -e "${RED}❌ Failed to install auto_mute.sh${NC}"
+        return 1
+    }
+    cp "$source_config" "$INSTALL_DIR/config.txt" || {
+        echo -e "${RED}❌ Failed to install config.txt${NC}"
+        return 1
+    }
     chmod +x "$INSTALL_DIR/auto_mute.sh"
 
     # Generate plist
@@ -96,14 +159,18 @@ cmd_on() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.automute.agent</string>
+    <string>${LAUNCHD_LABEL}</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
         <string>${INSTALL_DIR}/auto_mute.sh</string>
+        <string>--daemon</string>
     </array>
-    <key>StartInterval</key>
-    <integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
@@ -111,16 +178,14 @@ cmd_on() {
     <key>StandardErrorPath</key>
     <string>/tmp/auto_mute_error.log</string>
     <key>KeepAlive</key>
-    <false/>
+    <true/>
 </dict>
 </plist>
 PLIST
 
-    launchctl load "$PLIST_DST"
-
-    if is_running; then
+    if start_agent; then
         echo -e "${GREEN}✅ Auto-Mute is ON${NC}"
-        echo -e "   Checking WiFi every 10 seconds."
+        echo -e "   Monitoring network continuously (daemon mode)."
         echo -e "   ${DIM}Logs: /tmp/auto_mute.log${NC}"
     else
         echo -e "${RED}❌ Failed to start. Check /tmp/auto_mute_error.log${NC}"
@@ -129,16 +194,33 @@ PLIST
 }
 
 cmd_off() {
+    stop_agent
+
+    local still_running=false
     if is_running; then
-        launchctl unload "$PLIST_DST" 2>/dev/null
+        still_running=true
     fi
+
     rm -f "$PLIST_DST"
-    rm -rf "$INSTALL_DIR"
+
+    # Keep install files if launchd still reports active to avoid keepalive crash loops.
+    if [[ "$still_running" != "true" ]]; then
+        rm -rf "$INSTALL_DIR"
+    fi
+
     rm -f "$STATE_FILE"
+    rm -f "$NETWORK_KEY_FILE"
+    rm -f "$HOME/.auto_mute_last_dns"
+    rm -f "$HOME/.auto_mute_last_ipv4"
+    rm -f "$HOME/.auto_mute_last_wifi"
+    rm -f "$HOME/.auto_mute_wifi_ts"
     osascript -e 'set volume without output muted' 2>/dev/null
 
     echo -e "${GREEN}✅ Auto-Mute is OFF${NC}"
     echo -e "   Speakers unmuted."
+    if [[ "$still_running" == "true" ]]; then
+        echo -e "${YELLOW}⚠  launchd still reports ${LAUNCHD_LABEL} as active; install files were kept to avoid restart errors.${NC}"
+    fi
 }
 
 cmd_status() {
@@ -170,51 +252,93 @@ cmd_status() {
         echo -e "   ${DIM}(none — run 'automute add' to add one)${NC}"
     fi
 
-    # Current network
+    # Current network info
     echo ""
     local dns=$(get_dns_domain)
     if [[ -n "$dns" ]]; then
-        echo -e "📶 DNS Domain:  ${BOLD}$dns${NC}"
+        echo -e "🌐 DNS Domain:  ${BOLD}$dns${NC}"
     else
-        echo -e "📶 DNS Domain:  ${DIM}not connected${NC}"
+        echo -e "🌐 DNS Domain:  ${DIM}not connected${NC}"
     fi
 
-    # Match check
+    # Match check — try DNS first, then WIFI
     local matched=""
-    if [[ -n "$dns" && -f "$CONFIG_FILE" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" == DNS:* ]]; then
-                local target="${line#DNS:}"
-                target=$(echo "$target" | xargs)
-                if [[ "$dns" == *"$target"* ]]; then
-                    matched="$line"
-                    break
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Method 1: DNS matching
+        if [[ -n "$dns" ]]; then
+            while IFS= read -r line; do
+                if [[ "$line" == DNS:* ]]; then
+                    local target="${line#DNS:}"
+                    target=$(echo "$target" | xargs)
+                    if [[ "$dns" == *"$target"* ]]; then
+                        matched="$line"
+                        break
+                    fi
+                fi
+            done < "$CONFIG_FILE"
+        fi
+
+        # Method 2: WIFI name matching (only if DNS didn't match)
+        if [[ -z "$matched" ]]; then
+            local has_wifi_targets=false
+            while IFS= read -r line; do
+                [[ "$line" == WIFI:* ]] && has_wifi_targets=true && break
+            done < "$CONFIG_FILE"
+
+            if [[ "$has_wifi_targets" == "true" ]]; then
+                local wifi_name
+                wifi_name=$(get_wifi_name)
+                if [[ -n "$wifi_name" ]]; then
+                    echo -e "📶 WiFi Name:   ${BOLD}$wifi_name${NC}"
+                    while IFS= read -r line; do
+                        if [[ "$line" == WIFI:* ]]; then
+                            local target="${line#WIFI:}"
+                            target=$(echo "$target" | xargs)
+                            if [[ "$wifi_name" == "$target" ]]; then
+                                matched="$line"
+                                break
+                            fi
+                        fi
+                    done < "$CONFIG_FILE"
                 fi
             fi
-        done < "$CONFIG_FILE"
+        fi
     fi
+
     if [[ -n "$matched" ]]; then
         echo -e "${GREEN}✅ Match:       $matched${NC}"
     else
         echo -e "${RED}❌ Match:       Not on a target network${NC}"
     fi
 
-    # Audio
+    # Audio output device
+    local transport=$(get_output_transport)
     local muted=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
+
     if [[ "$muted" == "true" ]]; then
         echo -e "🔇 Speakers:    Muted"
     else
         echo -e "🔊 Speakers:    Not muted"
     fi
 
-    # Auto-mute state
-    if [[ -f "$STATE_FILE" ]]; then
-        local state=$(cat "$STATE_FILE")
-        if [[ "$state" == "muted_by_auto_mute" ]]; then
-            echo -e "🤖 Auto-Mute:   ${GREEN}Active${NC}"
+    if [[ -n "$transport" ]]; then
+        if [[ "$transport" == "Built-in" ]]; then
+            echo -e "🎧 Output:      ${BOLD}Built-in Speakers${NC}"
         else
-            echo -e "🤖 Auto-Mute:   ${DIM}Inactive${NC}"
+            echo -e "🎧 Output:      ${BOLD}$transport device${NC}"
         fi
+    fi
+
+    # Auto-mute state with reason
+    local state=""
+    [[ -f "$STATE_FILE" ]] && state=$(cat "$STATE_FILE")
+
+    if [[ "$state" == "muted_by_auto_mute" ]]; then
+        echo -e "🤖 Auto-Mute:   ${GREEN}Active — speakers muted by auto-mute${NC}"
+    elif [[ -z "$matched" ]]; then
+        echo -e "🤖 Auto-Mute:   ${DIM}Inactive — not on a target network${NC}"
+    elif [[ -n "$transport" && "$transport" != "Built-in" ]]; then
+        echo -e "🤖 Auto-Mute:   ${YELLOW}Paused — $transport audio connected (auto-mute only applies to built-in speakers)${NC}"
     else
         echo -e "🤖 Auto-Mute:   ${DIM}Inactive${NC}"
     fi
@@ -274,7 +398,7 @@ cmd_add() {
     local entry="${prefix}:${value}"
 
     # Check for duplicates
-    if grep -qF "$entry" "$CONFIG_FILE" 2>/dev/null; then
+    if grep -qxF "$entry" "$CONFIG_FILE" 2>/dev/null; then
         echo -e "${YELLOW}⚠  '$entry' is already configured.${NC}"
         return 0
     fi
@@ -285,8 +409,11 @@ cmd_add() {
     # Re-apply if running
     if is_running; then
         echo -e "${DIM}→ Updating running agent...${NC}"
-        cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null
-        echo -e "${GREEN}  Applied!${NC}"
+        if cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null; then
+            echo -e "${GREEN}  Applied!${NC}"
+        else
+            echo -e "${YELLOW}  Warning: Could not sync updated config to running agent.${NC}"
+        fi
     fi
 }
 
@@ -332,15 +459,20 @@ cmd_remove() {
     fi
 
     # Remove the line from config
-    if grep -qF "$value" "$CONFIG_FILE" 2>/dev/null; then
-        grep -vF "$value" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    if grep -qxF "$value" "$CONFIG_FILE" 2>/dev/null; then
+        # Use exact line matching and always replace the file, even if it becomes empty.
+        grep -vxF "$value" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
         echo -e "${GREEN}✅ Removed: $value${NC}"
 
         # Re-apply if running
         if is_running; then
             echo -e "${DIM}→ Updating running agent...${NC}"
-            cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null
-            echo -e "${GREEN}  Applied!${NC}"
+            if cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null; then
+                echo -e "${GREEN}  Applied!${NC}"
+            else
+                echo -e "${YELLOW}  Warning: Could not sync updated config to running agent.${NC}"
+            fi
         fi
     else
         echo -e "${YELLOW}⚠  '$value' not found in config.${NC}"

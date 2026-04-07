@@ -2,6 +2,14 @@
 
 Auto-Mute is a lightweight macOS utility designed to automatically mute your MacBook's speakers when connected to specific target WiFi networks. This is especially useful for automatically silencing your device in classes, libraries, or offices without manual intervention.
 
+## Current Updates (April 2026)
+
+- `automute on` now runs a persistent daemon in the background for continuous monitoring.
+- The daemon checks network state every 15 seconds for reliable WiFi transition detection.
+- WiFi matching reliability was improved by combining DNS state, WiFi name, and IPv4 fingerprint changes.
+- LaunchAgent startup/shutdown handling was hardened to avoid stale service restarts.
+- The `automute` wrapper now resolves symlink paths correctly so it always installs the latest script from the real project directory.
+
 ## How it Works
 
 The utility operates by checking your current network against a list of targets specified in the configuration file. It supports two different detection methods:
@@ -30,7 +38,7 @@ Edit `config.txt` and add the networks where you want your speakers to be muted.
 - Example WiFi Entry: `WIFI: Eduroam`
 
 ### 3. Setup the macOS Shortcut (Important)
-If you are strictly using `DNS:` matching in your configuration, you do not need this. However, **if you configure any `WIFI:` targets, you must run setup_shortcut.sh**. 
+If you are strictly using `DNS:` matching in your configuration, you do not need this. However, **if you configure any `WIFI:` targets, you must run setup_shortcut.sh**.
 
 macOS aggressively blocks terminal applications from reading WiFi names for privacy reasons. The application works around this by using the official Shortcuts app.
 
@@ -45,7 +53,7 @@ Run this command in the repository folder and follow the instructions:
   ```bash
   ./auto_mute.sh
   ```
-  *Tip: The script checks connection status exactly once when executed. For continuous auto-muting functionality, you can schedule it to run every few minutes quietly in the background using `cron` or `launchd`!*
+  *Tip: This does a single check and exits. For continuous auto-muting, use `automute on` (daemon mode).*
 
 - **Setup Mac Shortcut Helper**:
   ```bash
@@ -63,7 +71,7 @@ The `automute` command is the main way to control Auto-Mute. It handles turning 
 
 | Command | Description |
 |---------|-------------|
-| `automute on` | Start background monitoring (checks WiFi every 10s) |
+| `automute on` | Start background daemon monitoring (checks network every 15s) |
 | `automute off` | Stop monitoring, unmute speakers, and clean up |
 | `automute status` | Show running state, configured networks, and current match |
 | `automute add dns <domain>` | Add a DNS domain to monitor |
@@ -75,10 +83,24 @@ The `automute` command is the main way to control Auto-Mute. It handles turning 
 | `automute log` | Show recent log entries |
 | `automute help` | Show help |
 
+## Why Daemon Mode and 15-Second Checks?
+
+Running in daemon mode is important because WiFi transitions can happen while no terminal command is running. If Auto-Mute is not running continuously, it cannot react when you move between networks.
+
+The 15-second interval is a reliability/performance balance:
+
+- Fast enough to apply mute/unmute soon after a network switch.
+- Slow enough to avoid unnecessary CPU and battery usage.
+- More robust than relying only on event notifications, which can be inconsistent under launchd on some setups.
+
+In short: daemon mode keeps monitoring alive, and the 15-second loop ensures network changes are not missed.
+
 ### Quick Start Example
 ```bash
 # Add your network by DNS domain
-automute add dns example.edu or example.com or example.org
+automute add dns example.edu
+automute add dns example.com
+automute add dns example.org
 
 # Turn on auto-muting
 automute on
