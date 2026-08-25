@@ -4,6 +4,8 @@
 # Usage: automute [command]
 # ============================================================================
 
+umask 077
+
 APP_NAME="automute"
 SOURCE_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SOURCE_PATH" ]]; do
@@ -19,7 +21,16 @@ PLIST_NAME="${LAUNCHD_LABEL}.plist"
 PLIST_DST="$HOME/Library/LaunchAgents/$PLIST_NAME"
 STATE_FILE="$HOME/.auto_mute_state"
 NETWORK_KEY_FILE="$HOME/.auto_mute_last_network_key"
-LOG_FILE="/tmp/auto_mute.log"
+CHECK_LOCK_FILE="$HOME/.auto_mute.lock"
+LOG_DIR="$HOME/Library/Logs/Auto-Mute"
+LOG_FILE="$LOG_DIR/auto_mute.log"
+ERROR_LOG_FILE="$LOG_DIR/error.log"
+COMMAND_TIMEOUT_SECONDS=10
+
+# SleepWatcher paths
+WAKEUP_SCRIPT="$HOME/.wakeup"
+SLEEPWATCHER_INSTALLED_SCRIPT="$INSTALL_DIR/wakeup.sh"
+SLEEPWATCHER_LAUNCHD_PATTERN="sleepwatcher"
 
 # ── Colors ──────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -31,6 +42,34 @@ DIM='\033[2m'
 NC='\033[0m' # No Color
 
 # ── Helpers ─────────────────────────────────────────────────────
+run_with_timeout() {
+    /usr/bin/perl -e '
+        use POSIX ();
+        use Errno qw(EINTR);
+        my $seconds = shift;
+        my $pid = fork;
+        defined $pid or exit 125;
+        if (!$pid) {
+            defined POSIX::setpgid(0, 0) or POSIX::_exit(125);
+            POSIX::close(9);
+            exec { $ARGV[0] } @ARGV;
+            POSIX::_exit(127);
+        }
+        POSIX::setpgid($pid, $pid);
+        my $timed_out = 0;
+        local $SIG{ALRM} = sub { local ($!, $?); $timed_out = 1; kill 9, -$pid; kill 9, $pid };
+        alarm $seconds;
+        my $waited;
+        do { $waited = waitpid($pid, 0) } while ($waited < 0 && $! == EINTR);
+        my $status = $?;
+        alarm 0;
+        kill 9, -$pid;
+        exit 125 if $waited < 0;
+        exit 124 if $timed_out;
+        exit(($status & 127) ? 128 + ($status & 127) : $status >> 8);
+    ' "$COMMAND_TIMEOUT_SECONDS" "$@"
+}
+
 print_header() {
     echo ""
     echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════╗${NC}"
@@ -39,33 +78,40 @@ print_header() {
     echo ""
 }
 
+agent_status() {
+    run_with_timeout launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1
+    case $? in
+        0) return 0 ;;   # running
+        113) return 1 ;; # definitely absent
+        *) return 2 ;;   # launchctl failed or timed out
+    esac
+}
+
 is_running() {
-    launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 && return 0
-    launchctl list 2>/dev/null | grep -q "$LAUNCHD_LABEL"
+    agent_status
+    [[ $? -eq 0 ]]
 }
 
 stop_agent() {
-    launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
-    launchctl unload "$PLIST_DST" >/dev/null 2>&1 || true
-    launchctl remove "$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    run_with_timeout launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    run_with_timeout launchctl unload "$PLIST_DST" >/dev/null 2>&1 || true
+    run_with_timeout launchctl remove "$LAUNCHD_LABEL" >/dev/null 2>&1 || true
 }
 
 start_agent() {
-    # Clear any stale registration before loading the freshly copied script/config.
-    stop_agent
-
-    if launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1; then
+    if run_with_timeout launchctl bootstrap "gui/$(id -u)" "$PLIST_DST" >/dev/null 2>&1; then
         :
     else
-        launchctl load "$PLIST_DST" >/dev/null 2>&1 || return 1
+        run_with_timeout launchctl load "$PLIST_DST" >/dev/null 2>&1 || return 1
     fi
 
-    launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1 || true
-    is_running
+    agent_status
 }
 
 get_dns_domain() {
-    echo "show State:/Network/Global/DNS" | scutil 2>/dev/null \
+    local state
+    state=$(echo "show State:/Network/Global/DNS" | run_with_timeout scutil 2>/dev/null) || return 1
+    printf '%s\n' "$state" \
         | grep "SearchDomains" -A 5 \
         | grep -oE '[0-9]+ : .+' \
         | awk -F' : ' '{print $2}' \
@@ -73,18 +119,84 @@ get_dns_domain() {
 }
 
 get_wifi_name() {
-    shortcuts run "Get-WiFi-Name" 2>/dev/null | tr -d '\n'
+    local name
+    name=$(run_with_timeout shortcuts run "Get-WiFi-Name" 2>/dev/null) || return 1
+    printf '%s' "${name//$'\n'/}"
 }
 
-get_output_transport() {
-    system_profiler SPAudioDataType 2>/dev/null \
-        | awk '/Default Output Device: Yes/{found=1} found && /Transport:/{print $2; exit}'
+get_output_device() {
+    local audio device
+    audio=$(run_with_timeout system_profiler SPAudioDataType 2>/dev/null) || return 1
+    device=$(printf '%s\n' "$audio" | awk '
+        match($0, /[^[:space:]]/) == 9 && /:$/ {
+            name=$0
+            sub(/^[[:space:]]*/, "", name)
+            sub(/:$/, "", name)
+        }
+        /Default Output Device: Yes/ { found=1 }
+        found && /Transport:/ {
+            if ($2 != "" && name != "") print $2 "|" name
+            exit
+        }
+    ')
+    [[ -n "$device" ]] || return 1
+    printf '%s\n' "$device"
 }
 
-is_builtin_output() {
-    local transport
-    transport=$(get_output_transport)
-    [[ "$transport" == "Built-in" ]]
+is_sleepwatcher_installed() {
+    command -v sleepwatcher &>/dev/null ||
+        [[ -x /opt/homebrew/sbin/sleepwatcher || -x /usr/local/sbin/sleepwatcher ]]
+}
+
+is_sleepwatcher_running() {
+    # Fast check via launchctl instead of slow `brew services list` (~0.7s Ruby overhead)
+    run_with_timeout launchctl list 2>/dev/null | grep -q "$SLEEPWATCHER_LAUNCHD_PATTERN"
+}
+
+is_our_wakeup() {
+    # Returns 0 if ~/.wakeup is our symlink
+    [[ -L "$WAKEUP_SCRIPT" ]] && \
+        [[ "$(readlink "$WAKEUP_SCRIPT")" == "$SLEEPWATCHER_INSTALLED_SCRIPT" ]]
+}
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+write_state() {
+    local value="$1" tmp
+    tmp=$(mktemp "${STATE_FILE}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$value" > "$tmp" || ! mv -f "$tmp" "$STATE_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+read_state() {
+    [[ ! -e "$STATE_FILE" && ! -L "$STATE_FILE" ]] && { echo "unmuted"; return; }
+    [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+    local state
+    state=$(cat "$STATE_FILE") || return 1
+    case "$state" in
+        unmuted|muted_by_auto_mute|manual_unmuted_on_target|pending_mute|pending_unmute) printf '%s\n' "$state" ;;
+        *) return 1 ;;
+    esac
+}
+
+clear_cache() {
+    rm -f "$NETWORK_KEY_FILE" \
+        "$HOME/.auto_mute_last_dns" \
+        "$HOME/.auto_mute_last_ipv4" \
+        "$HOME/.auto_mute_last_wifi" \
+        "$HOME/.auto_mute_wifi_ts"
+}
+
+sync_config() {
+    local tmp="$INSTALL_DIR/config.txt.tmp"
+    cp "$CONFIG_FILE" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$INSTALL_DIR/config.txt"
 }
 
 ensure_config() {
@@ -107,8 +219,6 @@ cmd_on() {
     ensure_config
 
     local source_script="$SCRIPT_DIR/auto_mute.sh"
-    local source_config="$CONFIG_FILE"
-
     if [[ ! -f "$source_script" ]]; then
         echo -e "${RED}❌ Missing required file: $source_script${NC}"
         echo "   The automute command needs auto_mute.sh in the same folder as automute."
@@ -116,43 +226,73 @@ cmd_on() {
         return 1
     fi
 
-    if [[ ! -f "$source_config" ]]; then
-        echo -e "${YELLOW}⚠  Config not found next to automute. Creating: $source_config${NC}"
-        ensure_config
-    fi
-
     # Check if any targets are configured
-    local has_entries=false
+    local has_entries=false value
     while IFS= read -r line; do
         if [[ "$line" == DNS:* || "$line" == WIFI:* ]]; then
-            has_entries=true
-            break
+            value=$(trim "${line#*:}")
+            if [[ -n "$value" ]]; then
+                has_entries=true
+                break
+            fi
         fi
     done < "$CONFIG_FILE"
 
     if [[ "$has_entries" != "true" ]]; then
         echo -e "${YELLOW}⚠  No networks configured yet.${NC}"
-        echo -e "   Run ${BOLD}automute add${NC} to add a network first."
+        echo -e "   Run ${BOLD}./automute add${NC} to add a network first."
         return 1
     fi
 
-    # Copy files to install dir
-    mkdir -p "$INSTALL_DIR" || {
+    exec 9>"$CHECK_LOCK_FILE" || return 1
+    if ! /usr/bin/lockf -s -t 5 9; then
+        echo -e "${RED}❌ Another Auto-Mute check is stuck; install stopped safely after 5 seconds.${NC}"
+        return 1
+    fi
+
+    # Replace files only while no daemon or wake check can read them.
+    stop_agent
+    agent_status
+    local stopped_status=$?
+    if (( stopped_status != 1 )); then
+        exec 9>&-
+        echo -e "${RED}❌ Could not confirm the old daemon stopped; installed files were not changed.${NC}"
+        return 1
+    fi
+
+    is_our_wakeup && rm -f "$WAKEUP_SCRIPT"
+    if ! rm -f "$PLIST_DST"; then
+        echo -e "${RED}❌ Could not remove the old LaunchAgent file; install stopped safely.${NC}"
+        return 1
+    fi
+    local ownership_state
+    if ! ownership_state=$(read_state) || ! write_state "$ownership_state" || ! clear_cache; then
+        echo -e "${RED}❌ Could not migrate Auto-Mute's private state; install stopped safely.${NC}"
+        return 1
+    fi
+    mkdir -p "$INSTALL_DIR" "$(dirname "$PLIST_DST")" "$LOG_DIR" || {
         echo -e "${RED}❌ Failed to create install directory: $INSTALL_DIR${NC}"
         return 1
     }
+    chmod 700 "$INSTALL_DIR" "$LOG_DIR" || return 1
+    touch "$LOG_FILE" "$ERROR_LOG_FILE" && chmod 600 "$LOG_FILE" "$ERROR_LOG_FILE" || return 1
     cp "$source_script" "$INSTALL_DIR/auto_mute.sh" || {
         echo -e "${RED}❌ Failed to install auto_mute.sh${NC}"
         return 1
     }
-    cp "$source_config" "$INSTALL_DIR/config.txt" || {
+    if ! sync_config; then
         echo -e "${RED}❌ Failed to install config.txt${NC}"
         return 1
-    }
+    fi
     chmod +x "$INSTALL_DIR/auto_mute.sh"
 
-    # Generate plist
-    cat > "$PLIST_DST" << PLIST
+    # Generate and validate the plist before making it persistent.
+    local plist_tmp
+    plist_tmp=$(mktemp "${PLIST_DST}.tmp.XXXXXX") || {
+        echo -e "${RED}❌ Failed to stage the LaunchAgent file.${NC}"
+        return 1
+    }
+    cat > "$plist_tmp" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -174,61 +314,181 @@ cmd_on() {
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/auto_mute.log</string>
+    <string>${LOG_FILE}</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/auto_mute_error.log</string>
+    <string>${ERROR_LOG_FILE}</string>
     <key>KeepAlive</key>
     <true/>
 </dict>
 </plist>
 PLIST
+    if [[ $? -ne 0 ]] || ! plutil -lint "$plist_tmp" >/dev/null 2>&1 || ! mv -f "$plist_tmp" "$PLIST_DST"; then
+        rm -f "$plist_tmp" "$PLIST_DST"
+        exec 9>&-
+        echo -e "${RED}❌ Failed to create a valid LaunchAgent file.${NC}"
+        return 1
+    fi
+    exec 9>&-
 
     if start_agent; then
-        echo -e "${GREEN}✅ Auto-Mute is ON${NC}"
-        echo -e "   Monitoring network continuously (daemon mode)."
-        echo -e "   ${DIM}Logs: /tmp/auto_mute.log${NC}"
+        echo -e "${GREEN}✅ Auto-Mute daemon is ON${NC}"
+        echo -e "   Monitoring network continuously (polling every 15s)."
+        echo -e "   ${DIM}Logs: $LOG_FILE${NC}"
     else
-        echo -e "${RED}❌ Failed to start. Check /tmp/auto_mute_error.log${NC}"
+        stop_agent
+        agent_status
+        local rollback_status=$?
+        rm -f "$PLIST_DST"
+        if (( rollback_status != 1 )); then
+            echo -e "${RED}❌ Daemon startup failed and shutdown could not be confirmed. The plist was disabled; run './automute off' before retrying.${NC}"
+        else
+            echo -e "${RED}❌ Failed to start daemon. Check $ERROR_LOG_FILE${NC}"
+        fi
         return 1
+    fi
+
+    # ── SleepWatcher integration (optional) ──
+    local source_wakeup="$SCRIPT_DIR/wakeup.sh"
+    if [[ ! -f "$source_wakeup" ]]; then
+        echo -e "${YELLOW}⚠  wakeup.sh not found — skipping SleepWatcher setup.${NC}"
+        return 0
+    fi
+
+    if ! is_sleepwatcher_installed; then
+        echo -e "${DIM}💤 SleepWatcher not installed; the 15-second daemon remains active.${NC}"
+        echo -e "   ${DIM}Optional: brew install sleepwatcher && brew services start sleepwatcher${NC}"
+        echo -e "   ${DIM}Then re-run ./automute on.${NC}"
+        return 0
+    fi
+
+    # Do not take over another program's wake hook.
+    if [[ -e "$WAKEUP_SCRIPT" || -L "$WAKEUP_SCRIPT" ]] && ! is_our_wakeup; then
+        echo -e "${YELLOW}⚠  ~/.wakeup is already managed by another program; skipping the optional wake hook.${NC}"
+        return 0
+    fi
+
+    if ! is_sleepwatcher_running; then
+        echo -e "${YELLOW}⚠  SleepWatcher is installed but stopped; skipping the optional wake hook.${NC}"
+        echo -e "   ${DIM}Start it with: brew services start sleepwatcher, then re-run ./automute on.${NC}"
+        return 0
+    fi
+
+    if cp "$source_wakeup" "$SLEEPWATCHER_INSTALLED_SCRIPT" &&
+        chmod +x "$SLEEPWATCHER_INSTALLED_SCRIPT" &&
+        ln -sf "$SLEEPWATCHER_INSTALLED_SCRIPT" "$WAKEUP_SCRIPT"; then
+        echo -e "${GREEN}✅ SleepWatcher wake hook is ON${NC}"
+        echo -e "   Additional mute check on lid open (after the configured WiFi delay)."
+    else
+        echo -e "${YELLOW}⚠  Could not install the optional SleepWatcher wake hook.${NC}"
     fi
 }
 
 cmd_off() {
-    stop_agent
-
-    local still_running=false
-    if is_running; then
-        still_running=true
+    exec 9>"$CHECK_LOCK_FILE" || return 1
+    if ! /usr/bin/lockf -s -t 5 9; then
+        echo -e "${RED}❌ Another Auto-Mute check is stuck; cleanup stopped safely after 5 seconds.${NC}"
+        return 1
     fi
 
-    rm -f "$PLIST_DST"
+    stop_agent
+    agent_status
+    local stopped_status=$?
+    if (( stopped_status == 0 )); then
+        echo -e "${RED}❌ Failed to stop ${LAUNCHD_LABEL}; no files or audio state were changed.${NC}"
+        return 1
+    elif (( stopped_status != 1 )); then
+        echo -e "${RED}❌ Could not verify ${LAUNCHD_LABEL} stopped; cleanup was not attempted.${NC}"
+        return 1
+    fi
 
-    # Keep install files if launchd still reports active to avoid keepalive crash loops.
-    if [[ "$still_running" != "true" ]]; then
-        rm -rf "$INSTALL_DIR"
+    # Remove only our hook; SleepWatcher may be shared with other programs.
+    if is_our_wakeup; then
+        rm -f "$WAKEUP_SCRIPT"
+    fi
+
+    # Remove persistence before audio restoration so a deferred retry cannot
+    # resurrect the daemon at the next login.
+    if ! rm -f "$PLIST_DST" || ! rm -rf "$INSTALL_DIR"; then
+        echo -e "${RED}❌ Auto-Mute stopped, but its persistent files could not be removed.${NC}"
+        return 1
+    fi
+    clear_cache || {
+        echo -e "${RED}❌ Auto-Mute stopped, but its cached state could not be removed.${NC}"
+        return 1
+    }
+
+    local state
+    if ! state=$(read_state); then
+        echo -e "${RED}❌ Auto-Mute stopped, but its ownership state is invalid or unreadable; audio was not changed.${NC}"
+        return 1
+    fi
+
+    local restored=""
+    if [[ "$state" == pending_* ]]; then
+        if ! write_state "unmuted"; then
+            echo -e "${RED}❌ Auto-Mute stopped, but ambiguous ownership state could not be cleared.${NC}"
+            return 1
+        fi
+        restored=" Ambiguous mute left unchanged."
+    elif [[ "$state" == "muted_by_auto_mute" ]]; then
+        local output_device output_transport output_name
+        if ! output_device=$(get_output_device); then
+            echo -e "${RED}❌ Auto-Mute stopped, but the active output could not be identified; built-in speaker restoration is still pending.${NC}"
+            return 1
+        fi
+        IFS='|' read -r output_transport output_name <<< "$output_device"
+        if [[ "$output_transport" != "Built-in" || "$output_name" != *Speakers ]]; then
+            echo -e "${YELLOW}⚠  Auto-Mute stopped without changing '$output_name'. Switch to the built-in speakers and run './automute off' again to restore them.${NC}"
+            return 1
+        fi
+        if ! write_state "pending_unmute"; then
+            echo -e "${RED}❌ Auto-Mute stopped, but could not reserve the audio restoration; speakers were not changed.${NC}"
+            return 1
+        fi
+        run_with_timeout osascript -e 'set volume without output muted' 2>/dev/null || true
+
+        local after actual
+        after=$(get_output_device) || after=""
+        actual=$(run_with_timeout osascript -e 'output muted of (get volume settings)' 2>/dev/null) || actual=""
+        if [[ "$after" != "$output_device" || "$actual" != "false" ]]; then
+            echo -e "${RED}❌ Auto-Mute stopped, but speaker restoration could not be verified; pending state was kept so 'off' can retry.${NC}"
+            return 1
+        fi
+        if ! write_state "unmuted"; then
+            echo -e "${RED}❌ Speakers were restored, but ownership cleanup is still pending.${NC}"
+            return 1
+        fi
+        restored=" Speakers unmuted."
     fi
 
     rm -f "$STATE_FILE"
-    rm -f "$NETWORK_KEY_FILE"
-    rm -f "$HOME/.auto_mute_last_dns"
-    rm -f "$HOME/.auto_mute_last_ipv4"
-    rm -f "$HOME/.auto_mute_last_wifi"
-    rm -f "$HOME/.auto_mute_wifi_ts"
-    osascript -e 'set volume without output muted' 2>/dev/null
 
     echo -e "${GREEN}✅ Auto-Mute is OFF${NC}"
-    echo -e "   Speakers unmuted."
-    if [[ "$still_running" == "true" ]]; then
-        echo -e "${YELLOW}⚠  launchd still reports ${LAUNCHD_LABEL} as active; install files were kept to avoid restart errors.${NC}"
-    fi
+    [[ -n "$restored" ]] && echo -e "  $restored"
 }
 
 cmd_status() {
-    # Running?
-    if is_running; then
-        echo -e "${GREEN}🟢 Status:      Running${NC}"
+    # Daemon status
+    agent_status
+    case $? in
+        0) echo -e "${GREEN}🟢 Daemon:      Running${NC}" ;;
+        1) echo -e "${RED}🔴 Daemon:      Stopped${NC}" ;;
+        *) echo -e "${YELLOW}🟡 Daemon:      Status unavailable${NC}" ;;
+    esac
+
+    # SleepWatcher status
+    if ! is_sleepwatcher_installed; then
+        echo -e "${DIM}💤 SleepWatcher: Not installed${NC}  ${DIM}(optional — brew install sleepwatcher)${NC}"
+    elif is_sleepwatcher_running; then
+        echo -e "${GREEN}💤 SleepWatcher: Running${NC}"
     else
-        echo -e "${RED}🔴 Status:      Stopped${NC}"
+        echo -e "${RED}💤 SleepWatcher: Stopped${NC}"
+    fi
+
+    if is_our_wakeup; then
+        echo -e "${DIM}   ~/.wakeup:   Configured ✓${NC}"
+    elif [[ -e "$WAKEUP_SCRIPT" ]]; then
+        echo -e "${YELLOW}   ~/.wakeup:   Exists (not managed by automute)${NC}"
     fi
 
     # Configured networks
@@ -249,7 +509,7 @@ cmd_status() {
         done < "$CONFIG_FILE"
     fi
     if [[ $count -eq 0 ]]; then
-        echo -e "   ${DIM}(none — run 'automute add' to add one)${NC}"
+        echo -e "   ${DIM}(none — run './automute add' to add one)${NC}"
     fi
 
     # Current network info
@@ -269,11 +529,14 @@ cmd_status() {
             while IFS= read -r line; do
                 if [[ "$line" == DNS:* ]]; then
                     local target="${line#DNS:}"
-                    target=$(echo "$target" | xargs)
-                    if [[ "$dns" == *"$target"* ]]; then
-                        matched="$line"
-                        break
-                    fi
+                    target=$(trim "$target")
+                    local domain
+                    for domain in $dns; do
+                        if [[ "$domain" == "$target" || "$domain" == *."$target" ]]; then
+                            matched="$line"
+                            break 2
+                        fi
+                    done
                 fi
             done < "$CONFIG_FILE"
         fi
@@ -293,7 +556,7 @@ cmd_status() {
                     while IFS= read -r line; do
                         if [[ "$line" == WIFI:* ]]; then
                             local target="${line#WIFI:}"
-                            target=$(echo "$target" | xargs)
+                            target=$(trim "$target")
                             if [[ "$wifi_name" == "$target" ]]; then
                                 matched="$line"
                                 break
@@ -312,8 +575,10 @@ cmd_status() {
     fi
 
     # Audio output device
-    local transport=$(get_output_transport)
-    local muted=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
+    local output_device output_transport output_name
+    output_device=$(get_output_device) || output_device=""
+    IFS='|' read -r output_transport output_name <<< "$output_device"
+    local muted=$(run_with_timeout osascript -e 'output muted of (get volume settings)' 2>/dev/null)
 
     if [[ "$muted" == "true" ]]; then
         echo -e "🔇 Speakers:    Muted"
@@ -321,24 +586,26 @@ cmd_status() {
         echo -e "🔊 Speakers:    Not muted"
     fi
 
-    if [[ -n "$transport" ]]; then
-        if [[ "$transport" == "Built-in" ]]; then
-            echo -e "🎧 Output:      ${BOLD}Built-in Speakers${NC}"
-        else
-            echo -e "🎧 Output:      ${BOLD}$transport device${NC}"
-        fi
+    if [[ -n "$output_device" ]]; then
+        echo -e "🎧 Output:      ${BOLD}$output_name${NC}"
     fi
 
     # Auto-mute state with reason
     local state=""
-    [[ -f "$STATE_FILE" ]] && state=$(cat "$STATE_FILE")
+    state=$(read_state 2>/dev/null) || state="invalid"
 
-    if [[ "$state" == "muted_by_auto_mute" ]]; then
-        echo -e "🤖 Auto-Mute:   ${GREEN}Active — speakers muted by auto-mute${NC}"
+    if [[ "$state" == pending_* ]]; then
+        echo -e "🤖 Auto-Mute:   ${YELLOW}Pending — audio ownership is being reconciled${NC}"
+    elif [[ "$state" == "muted_by_auto_mute" ]]; then
+        if [[ -n "$output_device" && ( "$output_transport" != "Built-in" || "$output_name" != *Speakers ) ]]; then
+            echo -e "🤖 Auto-Mute:   ${YELLOW}Pending — built-in speaker restoration is deferred${NC}"
+        else
+            echo -e "🤖 Auto-Mute:   ${GREEN}Active — speakers muted by auto-mute${NC}"
+        fi
     elif [[ -z "$matched" ]]; then
         echo -e "🤖 Auto-Mute:   ${DIM}Inactive — not on a target network${NC}"
-    elif [[ -n "$transport" && "$transport" != "Built-in" ]]; then
-        echo -e "🤖 Auto-Mute:   ${YELLOW}Paused — $transport audio connected (auto-mute only applies to built-in speakers)${NC}"
+    elif [[ -n "$output_device" && ( "$output_transport" != "Built-in" || "$output_name" != *Speakers ) ]]; then
+        echo -e "🤖 Auto-Mute:   ${YELLOW}Paused — $output_name is active (auto-mute only applies to built-in speakers)${NC}"
     else
         echo -e "🤖 Auto-Mute:   ${DIM}Inactive${NC}"
     fi
@@ -353,12 +620,12 @@ cmd_add() {
     if [[ -z "$type" || -z "$value" ]]; then
         echo -e "${BOLD}Add a network to monitor:${NC}"
         echo ""
-        echo "  automute add dns <domain>     Add a DNS domain"
-        echo "  automute add wifi <name>      Add a WiFi network name"
+        echo "  ./automute add dns <domain>   Add a DNS domain"
+        echo "  ./automute add wifi <name>    Add a WiFi network name"
         echo ""
         echo -e "${DIM}Examples:${NC}"
-        echo "  automute add dns uic.edu"
-        echo "  automute add wifi HomeNetwork"
+        echo "  ./automute add dns uic.edu"
+        echo "  ./automute add wifi HomeNetwork"
         echo ""
 
         # Interactive mode
@@ -409,7 +676,7 @@ cmd_add() {
     # Re-apply if running
     if is_running; then
         echo -e "${DIM}→ Updating running agent...${NC}"
-        if cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null; then
+        if sync_config 2>/dev/null; then
             echo -e "${GREEN}  Applied!${NC}"
         else
             echo -e "${YELLOW}  Warning: Could not sync updated config to running agent.${NC}"
@@ -468,7 +735,7 @@ cmd_remove() {
         # Re-apply if running
         if is_running; then
             echo -e "${DIM}→ Updating running agent...${NC}"
-            if cp "$CONFIG_FILE" "$INSTALL_DIR/config.txt" 2>/dev/null; then
+            if sync_config 2>/dev/null; then
                 echo -e "${GREEN}  Applied!${NC}"
             else
                 echo -e "${YELLOW}  Warning: Could not sync updated config to running agent.${NC}"
@@ -497,7 +764,7 @@ cmd_list() {
     done < "$CONFIG_FILE"
 
     if [[ $count -eq 0 ]]; then
-        echo -e "  ${DIM}(none — run 'automute add' to add one)${NC}"
+        echo -e "  ${DIM}(none — run './automute add' to add one)${NC}"
     fi
 }
 
@@ -509,13 +776,13 @@ cmd_log() {
         echo ""
         echo -e "${DIM}For live log: tail -f $LOG_FILE${NC}"
     else
-        echo -e "${DIM}No log file yet. Start the agent with 'automute on'.${NC}"
+        echo -e "${DIM}No log file yet. Start the agent with './automute on'.${NC}"
     fi
 }
 
 cmd_help() {
     print_header
-    echo -e "${BOLD}Usage:${NC} automute <command>"
+    echo -e "${BOLD}Usage:${NC} ./automute <command>"
     echo ""
     echo -e "${BOLD}Commands:${NC}"
     echo -e "  ${GREEN}on${NC}              Start monitoring (mutes on target WiFi)"
@@ -529,12 +796,17 @@ cmd_help() {
     echo -e "  ${CYAN}log${NC}             Show recent log entries"
     echo -e "  ${CYAN}help${NC}            Show this help"
     echo ""
+    echo -e "${BOLD}How it works:${NC}"
+    echo -e "  A background daemon polls your network every 15 seconds."
+    echo -e "  If ${BOLD}SleepWatcher${NC} is installed and running, opening the lid"
+    echo -e "  triggers an additional check after the configurable WiFi delay."
+    echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  automute on                   Start the agent"
-    echo "  automute add dns uic.edu      Add UIC WiFi by domain"
-    echo "  automute add wifi HomeNet     Add home WiFi by name"
-    echo "  automute remove               Interactive removal"
-    echo "  automute off                  Stop and unmute"
+    echo "  ./automute on                 Start the agent"
+    echo "  ./automute add dns uic.edu    Add UIC WiFi by domain"
+    echo "  ./automute add wifi HomeNet   Add home WiFi by name"
+    echo "  ./automute remove             Interactive removal"
+    echo "  ./automute off                Stop; restore audio only if Auto-Mute muted it"
     echo ""
 }
 
@@ -552,7 +824,7 @@ case "${1:-}" in
     "")             cmd_help ;;
     *)
         echo -e "${RED}Unknown command: $1${NC}"
-        echo "Run 'automute help' for usage."
+        echo "Run './automute help' for usage."
         exit 1
         ;;
 esac

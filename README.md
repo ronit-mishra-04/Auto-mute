@@ -2,10 +2,12 @@
 
 Auto-Mute is a lightweight macOS utility designed to automatically mute your MacBook's speakers when connected to specific target WiFi networks. This is especially useful for automatically silencing your device in classes, libraries, or offices without manual intervention.
 
-## Current Updates (April 2026)
+## Current Updates (August 2026)
 
-- `automute on` now runs a persistent daemon in the background for continuous monitoring.
-- The daemon checks network state every 15 seconds for reliable WiFi transition detection.
+- **SleepWatcher lid-open detection**: if SleepWatcher is installed and running, `automute on` adds a wake check after the configurable WiFi stabilization delay. Auto-Mute never replaces another program's wake hook or starts/stops the shared service.
+- The existing 15-second polling daemon remains as a fallback for mid-session WiFi changes.
+- `automute status` now shows both daemon and SleepWatcher status.
+- `is_sleepwatcher_running()` uses `launchctl` instead of `brew services list` for faster checks.
 - WiFi matching reliability was improved by combining DNS state, WiFi name, and IPv4 fingerprint changes.
 - LaunchAgent startup/shutdown handling was hardened to avoid stale service restarts.
 - The `automute` wrapper now resolves symlink paths correctly so it always installs the latest script from the real project directory.
@@ -18,31 +20,60 @@ The utility operates by checking your current network against a list of targets 
 
 ## Project Files
 
-- `auto_mute.sh`: The core script that scans your network state and mutes/unmutes the speakers accordingly. It logs activity to `/tmp/auto_mute.log` (rotating automatically) and keeps state via hidden files in your home folder.
+- `auto_mute.sh`: The core script that scans your network state and mutes/unmutes the speakers accordingly. It logs activity privately under `~/Library/Logs/Auto-Mute/` (rotating automatically) and keeps state via hidden files in your home folder.
+- `wakeup.sh`: Wake-on-lid-open script invoked by SleepWatcher. Waits for WiFi to stabilize (configurable delay), then runs a single network check via `auto_mute.sh --once`.
 - `setup_shortcut.sh`: A helper interactive script you run once to create a macOS Shortcut named "Get-WiFi-Name". This shortcut bypasses the strict terminal restrictions and provides native access to read your WiFi's SSID.
-- `config.txt`: The configuration file where you declare the networks that should trigger auto-muting.
+- `config.txt`: The configuration file where you declare the networks that should trigger auto-muting, and optional settings like `LID_OPEN_DELAY`.
 - `automute`: Built executable/wrapper for the script.
 
 ## Setup Instructions
 
 ### 1. Clone the Repository
+
 Open your terminal and clone the code directly from the repository:
+
 ```bash
 git clone https://github.com/ronit-mishra-04/Auto-mute.git
 cd Auto-mute
 ```
 
-### 2. Configure Target Networks
-Edit `config.txt` and add the networks where you want your speakers to be muted. You can mix and match DNS domains and WiFi names. Matches are partial (e.g., `example.edu` will match `client.wireless.example.edu`).
+### 2. Install the `automute` Command in zsh
+
+From inside the cloned `Auto-mute` folder, run:
+
+```bash
+chmod +x automute auto_mute.sh wakeup.sh setup_shortcut.sh
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$PWD/automute" "$HOME/.local/bin/automute"
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" 2>/dev/null || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+source "$HOME/.zshrc"
+rehash
+```
+
+Verify that zsh can find it:
+
+```bash
+command -v automute
+automute status
+```
+
+You can now run `automute` from any directory. Keep the cloned `Auto-mute` folder in the same location because `~/.local/bin/automute` links to it.
+
+### 3. Configure Target Networks
+
+Edit `config.txt` and add the networks where you want your speakers to be muted. DNS entries match the exact domain or a subdomain (for example, `example.edu` matches `client.wireless.example.edu`); WiFi names match exactly.
+
 - Example DNS Entry: `DNS: example.edu`
 - Example WiFi Entry: `WIFI: Eduroam`
 
-### 3. Setup the macOS Shortcut (Important)
+### 4. Setup the macOS Shortcut (Important)
+
 If you are strictly using `DNS:` matching in your configuration, you do not need this. However, **if you configure any `WIFI:` targets, you must run setup_shortcut.sh**.
 
 macOS aggressively blocks terminal applications from reading WiFi names for privacy reasons. The application works around this by using the official Shortcuts app.
 
 Run this command in the repository folder and follow the instructions:
+
 ```bash
 ./setup_shortcut.sh
 ```
@@ -65,14 +96,14 @@ Run this command in the repository folder and follow the instructions:
   echo "show State:/Network/Global/DNS" | scutil
   ```
 
-## Using `automute`
+## Using `automute` from Any Directory
 
-The `automute` command is the main way to control Auto-Mute. It handles turning monitoring on/off, managing your network list, and checking status.
+After completing the zsh installation above, use these commands from anywhere:
 
 | Command | Description |
 |---------|-------------|
 | `automute on` | Start background daemon monitoring (checks network every 15s) |
-| `automute off` | Stop monitoring, unmute speakers, and clean up |
+| `automute off` | Stop monitoring and clean up; unmutes only if Auto-Mute owns the mute |
 | `automute status` | Show running state, configured networks, and current match |
 | `automute add dns <domain>` | Add a DNS domain to monitor |
 | `automute add wifi <name>` | Add a WiFi network name to monitor |
@@ -83,17 +114,38 @@ The `automute` command is the main way to control Auto-Mute. It handles turning 
 | `automute log` | Show recent log entries |
 | `automute help` | Show help |
 
-## Why Daemon Mode and 15-Second Checks?
+If Auto-Mute owns a built-in-speaker mute while headphones or another output are active, `automute off` removes the daemon without touching that external device. Switch back to the built-in speakers and run `automute off` once more to finish restoration.
 
-Running in daemon mode is important because WiFi transitions can happen while no terminal command is running. If Auto-Mute is not running continuously, it cannot react when you move between networks.
+## How Monitoring Works
 
-The 15-second interval is a reliability/performance balance:
+Auto-Mute uses a **dual-trigger architecture** for reliable network detection:
 
-- Fast enough to apply mute/unmute soon after a network switch.
-- Slow enough to avoid unnecessary CPU and battery usage.
-- More robust than relying only on event notifications, which can be inconsistent under launchd on some setups.
+### 1. Polling Daemon (always active)
+A background daemon checks your network state every 15 seconds. This catches all network changes, including mid-session WiFi switches while the lid is already open.
 
-In short: daemon mode keeps monitoring alive, and the 15-second loop ensures network changes are not missed.
+### 2. SleepWatcher Lid Detection (optional)
+If you run `brew install sleepwatcher && brew services start sleepwatcher` before `automute on`, opening the MacBook lid triggers an additional check after the stabilization delay. The daemon remains sufficient on its own.
+
+```
+Existing Daemon (always)          SleepWatcher (optional)
+┌────────────────────────┐       ┌─────────────────────┐
+│ auto_mute.sh --daemon  │       │ sleepwatcher service │
+│ polls every 15s        │       │ watches lid events   │
+│ catches mid-session    │       │        │             │
+│ WiFi changes           │       │   WAKE ▼             │
+└────────────────────────┘       │ ~/.wakeup            │
+                                 │ → sleep 15s          │
+                                 │ → auto_mute.sh --once│
+                                 └─────────────────────┘
+```
+
+### Configuration
+
+The lid-open delay is configurable in `config.txt`:
+```
+# Seconds to wait after lid opens before checking network (default: 15)
+LID_OPEN_DELAY:15
+```
 
 ### Quick Start Example
 ```bash

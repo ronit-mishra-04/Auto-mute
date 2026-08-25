@@ -12,12 +12,16 @@
 #                Run ./setup_shortcut.sh for setup instructions.
 #
 # Format: One entry per line. Use DNS: or WIFI: prefix.
-# Matching is partial — "example.edu" matches "client.wireless.example.edu".
+# DNS matches exact domains/subdomains; WiFi names match exactly.
 # ============================================================================
 
+
+# Seconds to wait after lid opens before checking network (default: 15)
+# LID_OPEN_DELAY:15
 
 # Examples (UNCOMMENT AND EDIT TO ADD MORE NETWORKS):
 # DNS: <ADD YOUR WIFI DNS HERE>
 # WIFI: <ADD YOUR WIFI NAME HERE>
 WIFI:UIC-WiFi
 WIFI:xROY 2GHz
+WIFI:eduroam
